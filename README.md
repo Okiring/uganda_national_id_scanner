@@ -11,7 +11,7 @@ Native PDF417 barcode scanner for **Ugandan National IDs**, for Android and iOS.
 ```yaml
 dependencies:
   national_id_scanner:
-    path: packages/national_id_scanner
+    git: <path-to-version>
 ```
 
 ### iOS
