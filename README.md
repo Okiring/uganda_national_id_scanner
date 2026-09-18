@@ -51,9 +51,3 @@ try {
   print(error.message);
 }
 ```
-
-## Package
-
-- Dart package name: `national_id_scanner`
-- Android package: `com.uganda.scanner`
-- Method channel: `com.uganda.scanner/national_id_scanner`
