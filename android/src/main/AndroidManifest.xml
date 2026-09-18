@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.CAMERA"/>
+  <application>
+    <activity
+      android:name="com.uganda.scanner.NationalIdScannerActivity"
+      android:exported="false"
+      android:screenOrientation="portrait"
+      android:theme="@style/Theme.AppCompat.NoActionBar"
+      android:configChanges="orientation|screenSize"/>
+  </application>
+</manifest>
