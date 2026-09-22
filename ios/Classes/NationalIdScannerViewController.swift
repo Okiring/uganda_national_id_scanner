@@ -1,8 +1,12 @@
 import AVFoundation
+import CoreImage
 import UIKit
 import ZXingCpp
 
-/// Full-screen AVFoundation + ZXing-C++ PDF417 scanner for Ugandan National IDs.
+/// Full-screen scanner for Ugandan National ID PDF417 barcodes.
+///
+/// Primary path: Apple `AVCaptureMetadataOutput` (most reliable on iOS).
+/// Fallback: ZXing-C++ on video frames (ROI + full frame).
 final class NationalIdScannerViewController: UIViewController {
   var onResult: ((String?) -> Void)?
 
@@ -14,12 +18,13 @@ final class NationalIdScannerViewController: UIViewController {
   private let flashButton = UIButton(type: .system)
 
   private let sessionQueue = DispatchQueue(label: "com.uganda.scanner.session")
+  private let metadataQueue = DispatchQueue(label: "com.uganda.scanner.metadata")
   private let decodeQueue = DispatchQueue(label: "com.uganda.scanner.decode")
   private let decodeLock = DispatchSemaphore(value: 1)
 
   private let reader: ZXIBarcodeReader = {
     let options = ZXIReaderOptions()
-    options.tryHarder = false
+    options.tryHarder = true
     options.tryRotate = true
     options.tryInvert = true
     options.tryDownscale = true
@@ -31,6 +36,10 @@ final class NationalIdScannerViewController: UIViewController {
   private var decoding = true
   private var didFinish = false
   private var captureDevice: AVCaptureDevice?
+  private var metadataOutput: AVCaptureMetadataOutput?
+  private var failedFrames = 0
+  private var latestGuideRectInView: CGRect = .zero
+  private var latestPreviewSize: CGSize = .zero
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -42,6 +51,9 @@ final class NationalIdScannerViewController: UIViewController {
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
     previewLayer.frame = view.bounds
+    latestPreviewSize = previewLayer.bounds.size
+    latestGuideRectInView = guideView.guideRect()
+    updateMetadataRectOfInterest()
   }
 
   override func viewWillDisappear(_ animated: Bool) {
@@ -132,20 +144,18 @@ final class NationalIdScannerViewController: UIViewController {
       guard let self else { return }
 
       self.captureSession.beginConfiguration()
-      self.captureSession.sessionPreset = .high
+      // Dense PDF417 on National IDs needs more pixels than 720p.
+      if self.captureSession.canSetSessionPreset(.hd1920x1080) {
+        self.captureSession.sessionPreset = .hd1920x1080
+      } else {
+        self.captureSession.sessionPreset = .high
+      }
 
-      let discovery = AVCaptureDevice.DiscoverySession(
-        deviceTypes: [
-          .builtInTripleCamera,
-          .builtInDualWideCamera,
-          .builtInDualCamera,
-          .builtInWideAngleCamera,
-        ],
-        mediaType: .video,
-        position: .back
-      )
+      let device =
+        AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        ?? AVCaptureDevice.default(for: .video)
 
-      guard let device = discovery.devices.first,
+      guard let device,
             let input = try? AVCaptureDeviceInput(device: device),
             self.captureSession.canAddInput(input)
       else {
@@ -158,24 +168,72 @@ final class NationalIdScannerViewController: UIViewController {
 
       self.captureDevice = device
       self.captureSession.addInput(input)
+      self.configureCameraForScanning(device)
 
-      let output = AVCaptureVideoDataOutput()
-      output.alwaysDiscardsLateVideoFrames = true
-      output.videoSettings = [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-      ]
-      output.setSampleBufferDelegate(self, queue: self.decodeQueue)
-
-      if self.captureSession.canAddOutput(output) {
-        self.captureSession.addOutput(output)
+      // Primary: Apple barcode detector.
+      let metadata = AVCaptureMetadataOutput()
+      if self.captureSession.canAddOutput(metadata) {
+        self.captureSession.addOutput(metadata)
+        metadata.setMetadataObjectsDelegate(self, queue: self.metadataQueue)
+        if metadata.availableMetadataObjectTypes.contains(.pdf417) {
+          metadata.metadataObjectTypes = [.pdf417]
+        }
+        self.metadataOutput = metadata
       }
 
-      if let connection = output.connection(with: .video), connection.isVideoOrientationSupported {
-        connection.videoOrientation = .portrait
+      // Fallback: ZXing on camera frames.
+      let video = AVCaptureVideoDataOutput()
+      video.alwaysDiscardsLateVideoFrames = true
+      video.videoSettings = [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      ]
+      video.setSampleBufferDelegate(self, queue: self.decodeQueue)
+      if self.captureSession.canAddOutput(video) {
+        self.captureSession.addOutput(video)
+        if let connection = video.connection(with: .video), connection.isVideoOrientationSupported {
+          connection.videoOrientation = .portrait
+        }
       }
 
       self.captureSession.commitConfiguration()
       self.captureSession.startRunning()
+
+      DispatchQueue.main.async { [weak self] in
+        self?.updateMetadataRectOfInterest()
+      }
+    }
+  }
+
+  private func configureCameraForScanning(_ device: AVCaptureDevice) {
+    do {
+      try device.lockForConfiguration()
+      if device.isFocusModeSupported(.continuousAutoFocus) {
+        device.focusMode = .continuousAutoFocus
+      }
+      if device.isExposureModeSupported(.continuousAutoExposure) {
+        device.exposureMode = .continuousAutoExposure
+      }
+      if device.isLowLightBoostSupported {
+        device.automaticallyEnablesLowLightBoostWhenAvailable = true
+      }
+      // Mild zoom helps dense PDF417 fill more of the sensor.
+      let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 3.0)
+      let targetZoom = min(1.6, maxZoom)
+      if targetZoom > 1.0 {
+        device.videoZoomFactor = targetZoom
+      }
+      device.unlockForConfiguration()
+    } catch {
+      // Ignore configuration failures; scanning may still work.
+    }
+  }
+
+  private func updateMetadataRectOfInterest() {
+    guard let metadataOutput, previewLayer.bounds.width > 1 else { return }
+    let guide = latestGuideRectInView == .zero ? guideView.guideRect() : latestGuideRectInView
+    let converted = previewLayer.metadataOutputRectConverted(fromLayerRect: guide)
+    sessionQueue.async {
+      metadataOutput.rectOfInterest = converted
     }
   }
 
@@ -220,12 +278,101 @@ final class NationalIdScannerViewController: UIViewController {
     didFinish = true
     decoding = false
 
-    if let rawValue {
-      NSLog("NationalIdScanner PDF417 received text: %@", rawValue)
+    sessionQueue.async { [weak self] in
+      self?.captureSession.stopRunning()
     }
 
     dismiss(animated: true) { [weak self] in
       self?.onResult?(rawValue)
+    }
+  }
+
+  private func mapGuideToBuffer(width: Int, height: Int) -> CGRect? {
+    let viewWidth = latestPreviewSize.width
+    let viewHeight = latestPreviewSize.height
+    let viewRoi = latestGuideRectInView
+    guard viewWidth > 1, viewHeight > 1, width > 0, height > 0, viewRoi.width > 1 else {
+      return nil
+    }
+
+    let bufferWidth = CGFloat(width)
+    let bufferHeight = CGFloat(height)
+
+    var coveredWidth = bufferWidth
+    var coveredHeight = bufferHeight
+    if viewWidth * coveredWidth < viewHeight * coveredHeight {
+      coveredWidth = coveredWidth * viewHeight / coveredHeight
+      coveredHeight = viewHeight
+    } else {
+      coveredHeight = coveredHeight * viewWidth / coveredWidth
+      coveredWidth = viewWidth
+    }
+
+    let previewRect = CGRect(
+      x: (viewWidth - coveredWidth) / 2,
+      y: (viewHeight - coveredHeight) / 2,
+      width: coveredWidth,
+      height: coveredHeight
+    )
+    guard previewRect.width > 0, previewRect.height > 0 else { return nil }
+
+    let normalized = CGRect(
+      x: (viewRoi.minX - previewRect.minX) / previewRect.width,
+      y: (viewRoi.minY - previewRect.minY) / previewRect.height,
+      width: viewRoi.width / previewRect.width,
+      height: viewRoi.height / previewRect.height
+    )
+
+    var mapped = CGRect(
+      x: normalized.minX * bufferWidth,
+      y: normalized.minY * bufferHeight,
+      width: normalized.width * bufferWidth,
+      height: normalized.height * bufferHeight
+    )
+
+    mapped = mapped.integral.intersection(CGRect(x: 0, y: 0, width: bufferWidth, height: bufferHeight))
+    guard mapped.width >= 8, mapped.height >= 8 else { return nil }
+    return mapped
+  }
+
+  private func croppedImage(from pixelBuffer: CVPixelBuffer, roi: CGRect) -> CIImage {
+    let full = CIImage(cvPixelBuffer: pixelBuffer)
+    let height = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+    let ciRoi = CGRect(
+      x: roi.minX,
+      y: height - roi.maxY,
+      width: roi.width,
+      height: roi.height
+    )
+    let cropped = full.cropped(to: ciRoi)
+    return cropped.transformed(
+      by: CGAffineTransform(translationX: -cropped.extent.origin.x, y: -cropped.extent.origin.y)
+    )
+  }
+}
+
+extension NationalIdScannerViewController: AVCaptureMetadataOutputObjectsDelegate {
+  func metadataOutput(
+    _ output: AVCaptureMetadataOutput,
+    didOutput metadataObjects: [AVMetadataObject],
+    from connection: AVCaptureConnection
+  ) {
+    guard decoding else { return }
+
+    for object in metadataObjects {
+      guard let code = object as? AVMetadataMachineReadableCodeObject,
+            code.type == .pdf417,
+            let value = code.stringValue,
+            !value.isEmpty
+      else {
+        continue
+      }
+
+      decoding = false
+      DispatchQueue.main.async { [weak self] in
+        self?.finish(with: value)
+      }
+      return
     }
   }
 }
@@ -237,32 +384,50 @@ extension NationalIdScannerViewController: AVCaptureVideoDataOutputSampleBufferD
     from connection: AVCaptureConnection
   ) {
     guard decoding else { return }
+    // Throttle ZXing — Apple metadata is primary; ZXing is expensive.
+    guard failedFrames % 3 == 0 else {
+      failedFrames += 1
+      return
+    }
     guard decodeLock.wait(timeout: .now()) == .success else { return }
     defer { decodeLock.signal() }
 
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let roi = mapGuideToBuffer(width: width, height: height)
+    let useRoi = (failedFrames % 6 == 0) && roi != nil
+
     do {
-      let results = try reader.read(pixelBuffer)
+      let results: [ZXIResult]
+      if useRoi, let roi {
+        results = try reader.read(croppedImage(from: pixelBuffer, roi: roi))
+      } else {
+        results = try reader.read(pixelBuffer)
+      }
+
       guard let match = results.first(where: {
         $0.format == .PDF_417 && !$0.text.isEmpty
       }) else {
+        failedFrames += 1
         return
       }
-      let text = match.text
 
       decoding = false
+      let text = match.text
       DispatchQueue.main.async { [weak self] in
         self?.finish(with: text)
       }
     } catch {
-      // Keep scanning on decode errors.
+      failedFrames += 1
     }
   }
 }
 
 private final class BarcodeGuideView: UIView {
   private let borderLayer = CAShapeLayer()
+  private var cachedGuideRect: CGRect = .zero
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -277,8 +442,14 @@ private final class BarcodeGuideView: UIView {
     fatalError("init(coder:) has not been implemented")
   }
 
-  override func layoutSubviews() {
-    super.layoutSubviews()
+  func guideRect() -> CGRect {
+    if cachedGuideRect == .zero {
+      updateGuideRect()
+    }
+    return cachedGuideRect
+  }
+
+  private func updateGuideRect() {
     var guideWidth = bounds.width * 0.92
     var guideHeight = guideWidth / 2.8
     let maximumHeight = bounds.height * 0.55
@@ -288,7 +459,12 @@ private final class BarcodeGuideView: UIView {
     }
     let left = (bounds.width - guideWidth) / 2
     let top = (bounds.height - guideHeight) / 2
-    let rect = CGRect(x: left, y: top, width: guideWidth, height: guideHeight)
-    borderLayer.path = UIBezierPath(roundedRect: rect, cornerRadius: 12).cgPath
+    cachedGuideRect = CGRect(x: left, y: top, width: guideWidth, height: guideHeight)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    updateGuideRect()
+    borderLayer.path = UIBezierPath(roundedRect: cachedGuideRect, cornerRadius: 12).cgPath
   }
 }

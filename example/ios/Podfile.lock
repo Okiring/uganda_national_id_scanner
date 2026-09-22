@@ -1,0 +1,39 @@
+PODS:
+  - Flutter (1.0.0)
+  - integration_test (0.0.1):
+    - Flutter
+  - national_id_scanner (0.1.0):
+    - Flutter
+    - zxing-cpp (~> 2.2.0)
+  - zxing-cpp (2.2.0):
+    - zxing-cpp/Wrapper (= 2.2.0)
+  - zxing-cpp/Core (2.2.0)
+  - zxing-cpp/Wrapper (2.2.0):
+    - zxing-cpp/Core
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - integration_test (from `.symlinks/plugins/integration_test/ios`)
+  - national_id_scanner (from `.symlinks/plugins/national_id_scanner/ios`)
+
+SPEC REPOS:
+  trunk:
+    - zxing-cpp
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  integration_test:
+    :path: ".symlinks/plugins/integration_test/ios"
+  national_id_scanner:
+    :path: ".symlinks/plugins/national_id_scanner/ios"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
+  national_id_scanner: de2f9d44a19e1c126d3649583be7535646f4ee70
+  zxing-cpp: 7486c8459df40d8f6a5453cc1ec35e67b10cd25a
+
+PODFILE CHECKSUM: 53a6aebc29ccee84c41f92f409fc20cd4ca011f1
+
+COCOAPODS: 1.16.2
