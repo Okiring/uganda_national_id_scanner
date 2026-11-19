@@ -1,6 +1,6 @@
 name: national_id_scanner
 description: Native PDF417 scanner for Ugandan National IDs (Android + iOS).
-version: 1.0.2
+version: 1.0.3
 homepage: https://github.com/uganda/national_id_scanner
 
 environment:
